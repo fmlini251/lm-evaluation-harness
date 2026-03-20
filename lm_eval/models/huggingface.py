@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import gc
 import logging
 import os
+from collections import Counter
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -54,6 +56,27 @@ if TYPE_CHECKING:
 
 eval_logger = logging.getLogger(__name__)
 TOKENIZER_INFINITY = 1000000000000000019884624838656
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fmt_mib(num_bytes: int) -> str:
+    return f"{(num_bytes / (1024 ** 2)):.1f}MiB"
 
 
 @register_model("hf-auto", "hf", "huggingface")
@@ -272,6 +295,36 @@ class HFLM(TemplateLM):
         self.batch_schedule = 1
         self.batch_sizes = {}
         self.max_batch_size = max_batch_size
+        self._max_seen_input_seq_len = 0
+        self._cuda_mem_debug = _env_bool("LM_EVAL_CUDA_MEM_DEBUG", False)
+        self._cuda_mem_debug_every = max(1, _env_int("LM_EVAL_CUDA_MEM_DEBUG_EVERY", 1))
+        self._cuda_mem_debug_sync = _env_bool("LM_EVAL_CUDA_MEM_DEBUG_SYNC", False)
+        self._cuda_mem_debug_gc = _env_bool("LM_EVAL_CUDA_MEM_DEBUG_GC", False)
+        self._cuda_mem_debug_empty_cache_every = max(
+            0, _env_int("LM_EVAL_CUDA_MEM_DEBUG_EMPTY_CACHE_EVERY", 0)
+        )
+        self._cuda_mem_debug_growth_warn_mb = max(
+            0, _env_int("LM_EVAL_CUDA_MEM_DEBUG_GROWTH_WARN_MB", 512)
+        )
+        self._cuda_mem_debug_tensor_scan_every = max(
+            0, _env_int("LM_EVAL_CUDA_MEM_DEBUG_TENSOR_SCAN_EVERY", 0)
+        )
+        self._cuda_mem_debug_tensor_scan_topk = max(
+            1, _env_int("LM_EVAL_CUDA_MEM_DEBUG_TENSOR_SCAN_TOPK", 12)
+        )
+        self._cuda_mem_debug_call_idx = 0
+        self._cuda_mem_debug_last_reserved = None
+        self._cuda_mem_debug_first_cleanup_alloc = None
+        self._disable_forward_kv_cache = _env_bool(
+            "LM_EVAL_DISABLE_FORWARD_KV_CACHE", False
+        )
+        self._force_no_attn_outputs = _env_bool(
+            "LM_EVAL_FORCE_NO_ATTN_OUTPUTS", True
+        )
+        self._force_no_hidden_states = _env_bool(
+            "LM_EVAL_FORCE_NO_HIDDEN_STATES", True
+        )
+        self._force_return_dict = _env_bool("LM_EVAL_FORCE_RETURN_DICT", False)
         self.softmax_dtype = (
             get_dtype(softmax_dtype) if softmax_dtype is not None else None
         )
@@ -342,6 +395,120 @@ class HFLM(TemplateLM):
         if prefix_token_id is not None:
             eval_logger.info(
                 f"Loglikelihood prefix token id used in evaluation: {self.prefix_token_id}"
+            )
+
+        if self._cuda_mem_debug and self.rank == 0:
+            print(
+                "[lm-eval][cuda-mem] debug enabled "
+                f"(every={self._cuda_mem_debug_every}, "
+                f"sync={self._cuda_mem_debug_sync}, "
+                f"empty_cache_every={self._cuda_mem_debug_empty_cache_every}, "
+                f"growth_warn_mb={self._cuda_mem_debug_growth_warn_mb}, "
+                f"tensor_scan_every={self._cuda_mem_debug_tensor_scan_every}, "
+                f"disable_forward_kv_cache={self._disable_forward_kv_cache}, "
+                f"force_no_attn_outputs={self._force_no_attn_outputs}, "
+                f"force_no_hidden_states={self._force_no_hidden_states}, "
+                f"force_return_dict={self._force_return_dict})"
+            )
+
+    def _cuda_debug_enabled(self) -> bool:
+        return (
+            self._cuda_mem_debug
+            and self.rank == 0
+            and torch.cuda.is_available()
+            and self.device.type == "cuda"
+        )
+
+    def _cuda_memory_stats(self) -> dict[str, int]:
+        device_idx = self.device.index
+        if device_idx is None:
+            device_idx = torch.cuda.current_device()
+
+        if self._cuda_mem_debug_sync:
+            torch.cuda.synchronize(device_idx)
+
+        return {
+            "allocated": int(torch.cuda.memory_allocated(device_idx)),
+            "reserved": int(torch.cuda.memory_reserved(device_idx)),
+            "max_allocated": int(torch.cuda.max_memory_allocated(device_idx)),
+            "max_reserved": int(torch.cuda.max_memory_reserved(device_idx)),
+        }
+
+    def _cuda_memory_log(self, tag: str, **fields) -> None:
+        if not self._cuda_debug_enabled():
+            return
+
+        stats = self._cuda_memory_stats()
+        reserved = stats["reserved"]
+        delta_reserved = None
+        if self._cuda_mem_debug_last_reserved is not None:
+            delta_reserved = reserved - self._cuda_mem_debug_last_reserved
+        self._cuda_mem_debug_last_reserved = reserved
+
+        base = [
+            f"tag={tag}",
+            f"alloc={_fmt_mib(stats['allocated'])}",
+            f"reserved={_fmt_mib(stats['reserved'])}",
+            f"peak_alloc={_fmt_mib(stats['max_allocated'])}",
+            f"peak_reserved={_fmt_mib(stats['max_reserved'])}",
+        ]
+        if delta_reserved is not None:
+            base.append(f"delta_reserved={_fmt_mib(delta_reserved)}")
+
+        for key, value in fields.items():
+            if value is not None:
+                base.append(f"{key}={value}")
+
+        print("[lm-eval][cuda-mem] " + " ".join(base))
+
+        if (
+            delta_reserved is not None
+            and self._cuda_mem_debug_growth_warn_mb > 0
+            and delta_reserved > self._cuda_mem_debug_growth_warn_mb * 1024 * 1024
+        ):
+            print(
+                "[lm-eval][cuda-mem][warn] reserved memory jump exceeded threshold "
+                f"({self._cuda_mem_debug_growth_warn_mb}MB): delta={_fmt_mib(delta_reserved)}"
+            )
+
+    def _cuda_tensor_scan_log(self, tag: str, topk: int | None = None) -> None:
+        if not self._cuda_debug_enabled():
+            return
+
+        topk = self._cuda_mem_debug_tensor_scan_topk if topk is None else topk
+        buckets = Counter()
+        scanned = 0
+
+        for obj in gc.get_objects():
+            try:
+                if not torch.is_tensor(obj):
+                    continue
+                if obj.device.type != "cuda":
+                    continue
+                if not obj.is_leaf and obj.grad_fn is not None:
+                    # Extra safety: inference path should not keep autograd graphs.
+                    continue
+
+                scanned += 1
+                numel = int(obj.numel())
+                elem_size = int(obj.element_size())
+                size_bytes = numel * elem_size
+                key = (tuple(obj.shape), str(obj.dtype))
+                buckets[key] += size_bytes
+            except Exception:
+                # Some objects may become invalid while iterating gc list.
+                continue
+
+        total_bytes = sum(buckets.values())
+        print(
+            "[lm-eval][cuda-mem][tensor-scan] "
+            f"tag={tag} scanned={scanned} distinct={len(buckets)} total={_fmt_mib(total_bytes)}"
+        )
+
+        for (shape, dtype), size_bytes in buckets.most_common(topk):
+            print(
+                "[lm-eval][cuda-mem][tensor-scan] "
+                f"tag={tag} size={_fmt_mib(size_bytes)} shape={shape} dtype={dtype}"
             )
 
     def _get_accelerate_args(
@@ -946,6 +1113,28 @@ class HFLM(TemplateLM):
             A torch tensor of shape [batch, sequence, vocab] with the
         logits returned from the model's decoder
         """
+        self._cuda_mem_debug_call_idx += 1
+        debug_this_call = self._cuda_debug_enabled() and (
+            self._cuda_mem_debug_call_idx % self._cuda_mem_debug_every == 0
+        )
+
+        batch_size = int(inps.shape[0]) if torch.is_tensor(inps) and inps.ndim >= 1 else None
+        seq_len = None
+        if torch.is_tensor(inps) and inps.ndim >= 2:
+            seq_len = int(inps.shape[-1])
+            if seq_len > self._max_seen_input_seq_len:
+                self._max_seen_input_seq_len = seq_len
+                if getattr(self, "rank", 0) == 0:
+                    print(f"[lm-eval] max input sequence length updated: {seq_len}")
+
+        if debug_this_call:
+            self._cuda_memory_log(
+                "model_call_pre",
+                call=self._cuda_mem_debug_call_idx,
+                batch=batch_size,
+                seq=seq_len,
+            )
+
         with (
             torch.no_grad(),
             torch.autocast(
@@ -954,18 +1143,56 @@ class HFLM(TemplateLM):
                 enabled=self.mixed_precision_dtype is not None,
             ),
         ):
+            common_kwargs = {}
+            if self._disable_forward_kv_cache:
+                common_kwargs["use_cache"] = False
+            if self._force_no_attn_outputs:
+                common_kwargs["output_attentions"] = False
+            if self._force_no_hidden_states:
+                common_kwargs["output_hidden_states"] = False
+            common_kwargs["return_dict"] = self._force_return_dict
+
             if attn_mask is not None or labels is not None:
                 assert attn_mask is not None and labels is not None
                 assert transformers.AutoModelForSeq2SeqLM == self.AUTO_MODEL_CLASS
-                return self.model(
-                    input_ids=inps, attention_mask=attn_mask, labels=labels
-                ).logits
+                outputs = self.model(
+                    input_ids=inps,
+                    attention_mask=attn_mask,
+                    labels=labels,
+                    **common_kwargs,
+                )
+                if isinstance(outputs, tuple):
+                    # With labels, tuple output is typically (loss, logits, ...)
+                    out = outputs[1] if len(outputs) > 1 else outputs[0]
+                else:
+                    out = outputs.logits
+                if debug_this_call:
+                    self._cuda_memory_log(
+                        "model_call_post",
+                        call=self._cuda_mem_debug_call_idx,
+                        batch=batch_size,
+                        seq=seq_len,
+                        logits_shape=tuple(out.shape),
+                        logits_dtype=str(out.dtype),
+                    )
+                return out
 
             assert self.AUTO_MODEL_CLASS in (
                 transformers.AutoModelForCausalLM,
                 transformers.AutoModelForVision2Seq,
             )
-            return self.model(inps).logits
+            outputs = self.model(inps, **common_kwargs)
+            out = outputs[0] if isinstance(outputs, tuple) else outputs.logits
+            if debug_this_call:
+                self._cuda_memory_log(
+                    "model_call_post",
+                    call=self._cuda_mem_debug_call_idx,
+                    batch=batch_size,
+                    seq=seq_len,
+                    logits_shape=tuple(out.shape),
+                    logits_dtype=str(out.dtype),
+                )
+            return out
 
     def _model_generate(
         self,
@@ -1193,7 +1420,7 @@ class HFLM(TemplateLM):
             disable=(disable_tqdm or (self.rank != 0)),
             desc="Running loglikelihood requests",
         )
-        for chunk in chunks:
+        for chunk_idx, chunk in enumerate(chunks, start=1):
             inps = []
             cont_toks_list = []
             inplens = []
@@ -1295,11 +1522,28 @@ class HFLM(TemplateLM):
                     "labels": batched_conts,
                 }
 
+            if self._cuda_debug_enabled() and chunk_idx % self._cuda_mem_debug_every == 0:
+                self._cuda_memory_log(
+                    "ll_chunk_pre",
+                    chunk=chunk_idx,
+                    chunk_size=len(chunk),
+                    padded_inp=padding_len_inp,
+                    padded_cont=padding_len_cont,
+                )
+
             multi_logits = F.log_softmax(
                 self._model_call(batched_inps, **call_kwargs),
                 dim=-1,
                 dtype=self.softmax_dtype,
             )  # [batch, padding_length (inp or cont), vocab]
+
+            if self._cuda_debug_enabled() and chunk_idx % self._cuda_mem_debug_every == 0:
+                self._cuda_memory_log(
+                    "ll_chunk_post_softmax",
+                    chunk=chunk_idx,
+                    multi_logits_shape=tuple(multi_logits.shape),
+                    softmax_dtype=str(multi_logits.dtype),
+                )
 
             for (request_str, ctx_tokens, _), logits, inplen, cont_toks in zip(
                 chunk, multi_logits, inplens, cont_toks_list, strict=True
@@ -1361,6 +1605,60 @@ class HFLM(TemplateLM):
                             "loglikelihood", request_str, answer
                         )
                     pbar.update(1)
+
+            # Loop variables persist after a Python for-loop and can keep views into
+            # `multi_logits` storage alive if not cleared explicitly.
+            logits = None
+            greedy_tokens = None
+            cont_toks = None
+            max_equal = None
+            answer = None
+            request_str = None
+            ctx_tokens = None
+            inplen = None
+            contlen = None
+            ctx_len = None
+
+            # Make tensor lifetimes explicit to improve leak diagnostics and reduce ref hold time.
+            multi_logits = None
+            batched_inps = None
+            inps = None
+            cont_toks_list = None
+            inplens = None
+            conts = None
+            encoder_attns = None
+            if self.backend == "seq2seq":
+                batched_conts = None
+                batched_encoder_mask = None
+            call_kwargs = {}
+
+            if self._cuda_mem_debug_gc:
+                gc.collect()
+            if (
+                self._cuda_debug_enabled()
+                and self._cuda_mem_debug_empty_cache_every > 0
+                and chunk_idx % self._cuda_mem_debug_empty_cache_every == 0
+            ):
+                clear_torch_cache()
+
+            if self._cuda_debug_enabled() and chunk_idx % self._cuda_mem_debug_every == 0:
+                cleanup_stats = self._cuda_memory_stats()
+                cleanup_alloc = cleanup_stats["allocated"]
+                if self._cuda_mem_debug_first_cleanup_alloc is None:
+                    self._cuda_mem_debug_first_cleanup_alloc = cleanup_alloc
+                alloc_drift = cleanup_alloc - self._cuda_mem_debug_first_cleanup_alloc
+                self._cuda_memory_log(
+                    "ll_chunk_post_cleanup",
+                    chunk=chunk_idx,
+                    alloc_drift_from_first_cleanup=_fmt_mib(alloc_drift),
+                )
+
+            if (
+                self._cuda_debug_enabled()
+                and self._cuda_mem_debug_tensor_scan_every > 0
+                and chunk_idx % self._cuda_mem_debug_tensor_scan_every == 0
+            ):
+                self._cuda_tensor_scan_log(tag=f"chunk_{chunk_idx}")
 
         pbar.close()
 
