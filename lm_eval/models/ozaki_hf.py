@@ -13,7 +13,9 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from types import MethodType
 
 import torch
@@ -28,6 +30,20 @@ eval_logger = logging.getLogger(__name__)
 class OzakiHFLM(HFLM):
     """HFLM subclass that applies Ozaki custom matmul after model loading."""
 
+    @staticmethod
+    def _is_gptq_model(pretrained: str) -> bool:
+        """Check if pretrained path contains a GPTQ quantized model."""
+        config_path = os.path.join(pretrained, "config.json")
+        if not os.path.isfile(config_path):
+            return False
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            qconfig = config.get("quantization_config", {})
+            return qconfig.get("quant_method", "") == "gptq"
+        except (json.JSONDecodeError, OSError):
+            return False
+
     def __init__(
         self,
         pretrained: str,
@@ -40,8 +56,8 @@ class OzakiHFLM(HFLM):
         shift_bits: int = 7,
         M_frac_bits: int = 8,
         # CustomGemmConfig args
-        in_feature_ts: int = 14336,
-        out_feature_ts: int = 14336,
+        in_feature_ts: int = 4096,
+        out_feature_ts: int = 4096,
         track_mtx_acc: bool = False,
         track_model_acc: bool = False,
         get_statistics: bool = False,
@@ -63,6 +79,13 @@ class OzakiHFLM(HFLM):
         # offloading=True -> load model on CPU, not GPU
         if offloading:
             kwargs["device"] = "cpu"
+
+        # Auto-detect GPTQ quantized models and load via AutoGPTQ
+        # so that layers become QuantLinear (required by ozaki_llama)
+        if "autogptq" not in kwargs and "gptqmodel" not in kwargs:
+            if self._is_gptq_model(pretrained):
+                kwargs["autogptq"] = True
+                eval_logger.info(f"Auto-detected GPTQ model at {pretrained}, using autogptq=True")
 
         super().__init__(pretrained=pretrained, **kwargs)
 
@@ -169,6 +192,8 @@ class OzakiHFLM(HFLM):
         # ozaki_config to GPU regardless of offloading
         ozaki_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         ozaki_config.to(ozaki_device)
+
+        print(self.model)
 
         eval_logger.info(
             f"Ozaki applied: s_lst={parsed_s_lst}, k={k}, rslt_type={rslt_type}, "
