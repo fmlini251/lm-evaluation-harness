@@ -9,6 +9,11 @@ Usage:
     lm_eval --model ozaki-hf \
         --model_args pretrained=meta-llama/Llama-3.1-8B,s_lst=2,k=256,dtype=bfloat16,offloading=True \
         --tasks hellaswag
+
+    # FP8 compressed model (equivalent to evaluate_ppl.py --dtype float8 --shift_bits 7 --rslt_type ozaki --s 6):
+    lm_eval --model ozaki-hf \
+        --model_args pretrained=neuralmagic/Meta-Llama-3.1-8B-FP8,dtype=float8,rslt_type=ozaki,s_lst=6,shift_bits=7,offloading=True \
+        --tasks hellaswag
 """
 
 from __future__ import annotations
@@ -55,9 +60,9 @@ class OzakiHFLM(HFLM):
         scale_method: str = "new_compressed",
         shift_bits: int = 7,
         M_frac_bits: int = 8,
-        # CustomGemmConfig args
-        in_feature_ts: int = 4096,
-        out_feature_ts: int = 4096,
+        # CustomGemmConfig args (defaults match evaluate_ppl.py)
+        in_feature_ts: int = 14336,
+        out_feature_ts: int = 14336,
         track_mtx_acc: bool = False,
         track_model_acc: bool = False,
         get_statistics: bool = False,
@@ -80,6 +85,16 @@ class OzakiHFLM(HFLM):
         if offloading:
             kwargs["device"] = "cpu"
 
+        # Handle dtype=float8: FP8 models (e.g. neuralmagic/Meta-Llama-3.1-8B-FP8)
+        # are loaded as bfloat16 by HF; compressed_tensors keeps weights in float8.
+        # This matches evaluate_ppl.py's get_llm() behavior.
+        self._is_float8 = False
+        hf_dtype = kwargs.get("dtype", "auto")
+        if str(hf_dtype) == "float8":
+            self._is_float8 = True
+            kwargs["dtype"] = "bfloat16"
+            eval_logger.info("dtype=float8 detected: loading model as bfloat16 (FP8 weights handled by compressed_tensors)")
+
         # Auto-detect GPTQ quantized models and load via AutoGPTQ
         # so that layers become QuantLinear (required by ozaki_llama)
         if "autogptq" not in kwargs and "gptqmodel" not in kwargs:
@@ -88,6 +103,10 @@ class OzakiHFLM(HFLM):
                 eval_logger.info(f"Auto-detected GPTQ model at {pretrained}, using autogptq=True")
 
         super().__init__(pretrained=pretrained, **kwargs)
+
+        # Store float8 dtype on model config (matching evaluate_ppl.py behavior)
+        if self._is_float8 and hasattr(self.model, "config"):
+            self.model.config.dtype = "float8"
 
         # Force eager attention so create_causal_mask always produces a 4D mask.
         # AutoGPTQ ignores attn_implementation and defaults to "sdpa", which can
@@ -121,12 +140,6 @@ class OzakiHFLM(HFLM):
         )
         from emulation.llm.ozaki_llama import prepare_model_for_custom_matmul
         from emulation.llm.utils import prepare_ozaki, prepare_memory_offloading, offloading_forward
-
-        # Auto-adjust tile sizes for 70B models (matching evaluate_ppl.py)
-        if "70B" in str(pretrained):
-            in_feature_ts = 14336
-            out_feature_ts = 8192
-            eval_logger.info("Detected 70B model, adjusted out_feature_ts=8192")
 
         custom_gemm_config = CustomGemmConfig(
             in_feature_ts=in_feature_ts,
