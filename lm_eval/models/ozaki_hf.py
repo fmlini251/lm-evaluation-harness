@@ -89,6 +89,14 @@ class OzakiHFLM(HFLM):
 
         super().__init__(pretrained=pretrained, **kwargs)
 
+        # Force eager attention so create_causal_mask always produces a 4D mask.
+        # AutoGPTQ ignores attn_implementation and defaults to "sdpa", which can
+        # return None (relying on SDPA's is_causal flag). Our custom eager
+        # attention needs an explicit mask, so without this fix the model runs
+        # without causal masking and produces random-level accuracy.
+        if hasattr(self.model, "config"):
+            self.model.config._attn_implementation = "eager"
+
         if s_lst is None or s_lst == "":
             eval_logger.warning("No s_lst provided, skipping Ozaki matmul setup")
             return
