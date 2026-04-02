@@ -54,7 +54,7 @@ class OzakiHFLM(HFLM):
         pretrained: str,
         # Ozaki-specific args (matching evaluate_ppl.py argparse)
         s_lst: str | None = None,
-        k: int = 256,
+        k: int = 128,
         rslt_type: str = "ozaki",
         rounding: str = "round_half_away_from_0",
         scale_method: str = "new_compressed",
@@ -101,6 +101,8 @@ class OzakiHFLM(HFLM):
             if self._is_gptq_model(pretrained):
                 kwargs["autogptq"] = True
                 eval_logger.info(f"Auto-detected GPTQ model at {pretrained}, using autogptq=True")
+
+        self._ozaki_k = int(k)
 
         super().__init__(pretrained=pretrained, **kwargs)
 
@@ -223,3 +225,8 @@ class OzakiHFLM(HFLM):
         )
         eval_logger.info(f"CustomGemmConfig: {custom_gemm_config}")
         eval_logger.info(f"GlobalOzakiConfig: {ozaki_config}")
+
+    def get_model_info(self) -> dict:
+        info = super().get_model_info()
+        info["k"] = self._ozaki_k
+        return info

@@ -455,10 +455,12 @@ class Run(SubCommand):
 
             # Print results
             cfg.model_args.pop("trust_remote_code", None)
+            k_value = results.get("config", {}).get("k", None)
+            k_str = f", k: {k_value}" if k_value is not None else ""
             print(
                 f"{cfg.model} ({cfg.model_args}), gen_kwargs: ({cfg.gen_kwargs}), "
                 f"limit: {cfg.limit}, num_fewshot: {cfg.num_fewshot}, "
-                f"batch_size: {cfg.batch_size}{f' ({batch_sizes})' if batch_sizes else ''}"
+                f"batch_size: {cfg.batch_size}{f' ({batch_sizes})' if batch_sizes else ''}{k_str}"
             )
             print(make_table(results))
             if "groups" in results:
