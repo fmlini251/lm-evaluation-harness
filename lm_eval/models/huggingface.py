@@ -31,6 +31,16 @@ from transformers.models.auto.modeling_auto import (
 from lm_eval import utils
 from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
+from lm_eval.batch_checkpoint import (
+    BatchCheckpointManager,
+    _hash_requests,
+    save_single_batch,
+    batch_exists,
+    load_single_batch,
+    load_all_batches,
+    find_missing_batches,
+    clear_all_batches,
+)
 from lm_eval.models.utils import (
     Collator,
     _add_special_kwargs,
@@ -1415,12 +1425,53 @@ class HFLM(TemplateLM):
         )
 
         chunks = re_ord.get_batched(n=batch_size, batch_fn=batch_fn)
+
+        # --- Batch checkpoint setup ---
+        _ckpt_method = "loglikelihood"
+        _ckpt_hash = _hash_requests(requests, _ckpt_method)
+        _ckpt_is_contexts = (re_ord._group_by == "contexts")
+        # --- End checkpoint setup ---
+
         pbar = tqdm(
             total=len(requests),
             disable=(disable_tqdm or (self.rank != 0)),
             desc="Running loglikelihood requests",
         )
+
         for chunk_idx, chunk in enumerate(chunks, start=1):
+            # --- Batch checkpoint: skip/replay logic ---
+            _skip_this_batch = False
+
+            if BatchCheckpointManager.is_enabled():
+                # Already have this batch on disk → load from cache
+                if batch_exists(_ckpt_method, _ckpt_hash, chunk_idx):
+                    cached = load_single_batch(_ckpt_method, _ckpt_hash, chunk_idx)
+                    if cached is not None:
+                        res.extend(cached["batch_results"])
+                        re_ord._reorder_indices.extend(cached["batch_reorder_indices"])
+                        pbar.update(len(cached["batch_results"]))
+                        _skip_this_batch = True
+
+                # Outside configured range and no cache → skip Collator state + raise later
+                if not _skip_this_batch and not BatchCheckpointManager.in_range(chunk_idx):
+                    # Replay Collator state so indices stay consistent
+                    if _ckpt_is_contexts:
+                        for (_, ctx_tokens, cont_enc) in chunk:
+                            key = tuple(ctx_tokens + cont_enc[:-1])
+                            cache_hit = re_ord._arr_with_indices.pop(key, None)
+                            if cache_hit:
+                                re_ord._reorder_indices.extend(x[0] for x in cache_hit)
+                    # No results to add — this range wasn't assigned to this GPU
+                    _skip_this_batch = True
+
+            if _skip_this_batch:
+                continue
+            # --- End checkpoint skip/replay ---
+
+            # Track batch boundary for per-batch checkpoint save
+            _ckpt_batch_res_start = len(res)
+            _ckpt_batch_ri_start = len(re_ord._reorder_indices)
+
             inps = []
             cont_toks_list = []
             inplens = []
@@ -1632,6 +1683,14 @@ class HFLM(TemplateLM):
                 batched_encoder_mask = None
             call_kwargs = {}
 
+            # --- Batch checkpoint: save this batch's results ---
+            save_single_batch(
+                _ckpt_method, _ckpt_hash, chunk_idx,
+                batch_results=res[_ckpt_batch_res_start:],
+                batch_reorder_indices=re_ord._reorder_indices[_ckpt_batch_ri_start:],
+            )
+            # --- End checkpoint save ---
+
             if self._cuda_mem_debug_gc:
                 gc.collect()
             if (
@@ -1718,7 +1777,36 @@ class HFLM(TemplateLM):
         )
         chunks = re_ords.get_batched(n=batch_size, batch_fn=batch_fn)
         eos = self.tok_decode(self.eot_token_id, skip_special_tokens=False)
+
+        # --- Batch checkpoint setup ---
+        _ckpt_method = "generate_until"
+        _ckpt_hash = _hash_requests(requests, _ckpt_method)
+        _ckpt_batch_idx = 0
+        # --- End checkpoint setup ---
+
         for chunk in chunks:
+            _ckpt_batch_idx += 1
+
+            # --- Batch checkpoint: skip/replay logic ---
+            _skip_this_batch = False
+            if BatchCheckpointManager.is_enabled():
+                # Already have this batch on disk → load from cache
+                if batch_exists(_ckpt_method, _ckpt_hash, _ckpt_batch_idx):
+                    cached = load_single_batch(_ckpt_method, _ckpt_hash, _ckpt_batch_idx)
+                    if cached is not None:
+                        res.extend(cached["batch_results"])
+                        pbar.update(len(cached["batch_results"]))
+                        _skip_this_batch = True
+
+                # Outside range and no cache → skip (no results to add)
+                if not _skip_this_batch and not BatchCheckpointManager.in_range(_ckpt_batch_idx):
+                    _skip_this_batch = True
+
+            if _skip_this_batch:
+                continue
+            # --- End checkpoint skip/replay ---
+
+            _ckpt_batch_res_start = len(res)
             contexts, all_gen_kwargs = zip(*chunk, strict=True)
             # we assume all gen kwargs in the batch are the same
             # this is safe to assume because the `grouper` object ensures it.
@@ -1802,6 +1890,15 @@ class HFLM(TemplateLM):
 
                 self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s)
                 pbar.update(1)
+
+            # --- Batch checkpoint: save this batch ---
+            save_single_batch(
+                _ckpt_method, _ckpt_hash, _ckpt_batch_idx,
+                batch_results=res[_ckpt_batch_res_start:],
+                batch_reorder_indices=[],  # gen_kwargs: indices set in _reorder(), not per-batch
+            )
+            # --- End checkpoint save ---
+
         # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
 
